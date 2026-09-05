@@ -1,0 +1,1 @@
+pyinstaller --onefile --name LuckywareShieldUltra --add-data ".env;." --hidden-import=modules.webhook_hunter --hidden-import=modules.clipboard_guard --hidden-import=modules.injection_detector --hidden-import=modules.report_generator --hidden-import=modules.sdk_scanner main.py

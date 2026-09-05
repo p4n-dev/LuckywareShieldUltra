@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.py[cod]
+*.pyo
+quarantine/
+c2_cache.json
+logs/
+build/
+dist/
+*.spec
+.agents/
