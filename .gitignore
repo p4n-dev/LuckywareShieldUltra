@@ -8,3 +8,5 @@ logs/
 build/
 dist/
 *.spec
+skills-lock.json
+.agents/
