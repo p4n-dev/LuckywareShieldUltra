@@ -4,13 +4,16 @@ import argparse
 import time
 import json
 import winreg
+import subprocess
+import ctypes
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import APP_NAME, APP_VERSION, QUARANTINE_DIR
 from modules.utils import (
-    Colors, is_admin, require_admin_prompt,
+    Colors, is_admin, require_admin_prompt, require_admin_or_elevate,
+    elevate_to_admin,
     log_info, log_success, log_warning, log_error, log_header
 )
 from modules.network_shield import NetworkShield
@@ -25,9 +28,53 @@ from modules.clipboard_guard import ClipboardGuard
 from modules.injection_detector import InjectionDetector
 from modules.report_generator import ReportGenerator
 
+# ──────────────────────────────────────────────────────────────────────────────
+# BANNER
+# ──────────────────────────────────────────────────────────────────────────────
+
 def print_banner():
-    print(f"\n{Colors.CYAN}{APP_NAME} [v{APP_VERSION}]{Colors.ENDC}\n")
-    require_admin_prompt()
+    admin_tag = f"{Colors.GREEN}[ADMIN]{Colors.ENDC}" if is_admin() else f"{Colors.WARNING}[ADMIN YOK]{Colors.ENDC}"
+    print(f"\n{Colors.CYAN}{Colors.BOLD}{APP_NAME} [v{APP_VERSION}]{Colors.ENDC}  {admin_tag}\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STARTUP GUARD  –  EXE acildiginda otomatik calisir
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _startup_guard():
+    """
+    Uygulama ilk acildiginda hizli bir kontrol yapar:
+      • Admin yetkisi yoksa UAC ister
+      • Hosts kalkani aktif mi kontrol eder, yoksa uygular
+      • Supheli baslangic kayitlarini loglar (silmez)
+    Bu fonksiyon ne interactive_menu'yu ne de watchdog'u baslatir;
+    sadece zemin hazirligi yapar.
+    """
+    if not is_admin():
+        print(f"\n{Colors.WARNING}╔══════════════════════════════════════════════════════╗{Colors.ENDC}")
+        print(f"{Colors.WARNING}║  Yonetici yetkisi gerekli — UAC penceresi aciliyor  ║{Colors.ENDC}")
+        print(f"{Colors.WARNING}╚══════════════════════════════════════════════════════╝{Colors.ENDC}\n")
+        elevated = elevate_to_admin()
+        if elevated:
+            sys.exit(0)
+        # UAC reddedildi — admin gerektirmeyen moddda devam et
+        print(f"{Colors.WARNING}[!] UAC reddedildi. Kisitli modda devam ediliyor.{Colors.ENDC}")
+        return
+
+    # Admin: hizli hosts kontrolu
+    try:
+        net = NetworkShield()
+        if not net.is_hosts_shield_active():
+            log_info("Hosts kalkani aktif degil — uygulanıyor...")
+            net.apply_hosts_block()
+            net.apply_firewall_rules()
+        else:
+            log_success("Hosts kalkani aktif.")
+    except Exception as e:
+        log_warning(f"Baslangic hosts kontrolu basarisiz: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FULL PROTECTION
+# ──────────────────────────────────────────────────────────────────────────────
 
 def run_full_protection():
     log_header("Tam Sistem Korumasi Baslatiliyor")
@@ -85,6 +132,10 @@ def run_full_protection():
 
     log_success("Tam koruma tamamlandi.\n")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# MENU FUNCTIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
 def menu_sdk_scan():
     log_header("SDK ve Proje Dosyasi Taramasi")
     scanner = SDKProjectScanner()
@@ -112,6 +163,7 @@ def menu_sdk_scan():
                 scanner.clean_infected_file(f["file_path"])
     else:
         log_success("Tehdit bulunamadi.")
+
 
 def menu_persistence():
     log_header("Baslangic ve Kayit Defteri Temizligi")
@@ -141,14 +193,23 @@ def menu_persistence():
             res = guard.clean_all_persistence()
             log_success(f"Sonuc: {res}")
 
+
 def menu_live_watchdog(silent: bool = False):
+    """
+    Canli Kalkan / Real-Time Watchdog.
+    silent=True oldugunda log olmadan arka planda calisir (daemon modu).
+    """
     if not silent:
         log_header("Canli Kalkan (Real-Time Watchdog)")
         print("Canli kalkan calisiyor. Cikmak icin CTRL+C basin.\n")
 
-    net = NetworkShield()
-    net.apply_hosts_block()
-    net.apply_firewall_rules()
+    # Hosts + firewall
+    if is_admin():
+        net = NetworkShield()
+        net.apply_hosts_block()
+        net.apply_firewall_rules()
+    elif not silent:
+        log_warning("Admin yetkisi yok — hosts/firewall kalkani aktif edilemiyor.")
 
     shield = LiveShield(auto_terminate=True)
     shield.start()
@@ -169,24 +230,123 @@ def menu_live_watchdog(silent: bool = False):
             if clip_guard.detection_count:
                 log_warning(f"Clipper tespiti: {clip_guard.detection_count}")
 
-def toggle_autostart(enable: bool = True):
-    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    value_name = "LuckywareShieldUltra"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# AUTOSTART  –  Registry  +  Task Scheduler
+# ──────────────────────────────────────────────────────────────────────────────
+
+def toggle_autostart(enable: bool = True, use_task_scheduler: bool = False):
+    """
+    Windows baslangicina ekle / kaldir.
+    use_task_scheduler=True ise Task Scheduler kullanir (admin gereksiz, UAC bypass olmaz).
+    """
+    value_name = "LuckywareShieldUltra"
+    task_name  = "LuckywareShieldUltra"
+
+    if use_task_scheduler:
+        _toggle_task_scheduler(enable, task_name)
+    else:
+        _toggle_registry_autostart(enable, value_name)
+
+
+def _toggle_registry_autostart(enable: bool, value_name: str):
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
             if enable:
-                cmd = f'"{sys.executable}" --daemon' if getattr(sys, 'frozen', False) else f'"{sys.executable}" "{Path(__file__).resolve()}" --daemon'
+                if getattr(sys, 'frozen', False):
+                    # EXE olarak calisiyorsa
+                    cmd = f'"{sys.executable}" --daemon'
+                else:
+                    cmd = f'"{sys.executable}" "{Path(__file__).resolve()}" --daemon'
                 winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, cmd)
-                log_success("Otomatik baslatma aktif edildi.")
+                log_success("Otomatik baslatma aktif edildi (Registry).")
+                log_info(f"Komut: {cmd}")
             else:
                 try:
                     winreg.DeleteValue(key, value_name)
-                    log_success("Otomatik baslatma kaldirildi.")
+                    log_success("Otomatik baslatma kaldirildi (Registry).")
                 except FileNotFoundError:
-                    log_info("Zaten kayitli degil.")
+                    log_info("Registry'de kayitli degil.")
     except Exception as e:
-        log_error(f"Hata: {e}")
+        log_error(f"Registry autostart hatasi: {e}")
+
+
+def _toggle_task_scheduler(enable: bool, task_name: str):
+    """Task Scheduler ile system seviyesinde baslangic."""
+    if not is_admin():
+        log_error("Task Scheduler icin Administrator yetkisi gereklidir.")
+        return
+
+    if getattr(sys, 'frozen', False):
+        exe_path = sys.executable
+        args = "--daemon"
+    else:
+        exe_path = sys.executable
+        args = f'"{Path(__file__).resolve()}" --daemon'
+
+    if enable:
+        cmd = [
+            "schtasks", "/Create", "/F",
+            "/TN", task_name,
+            "/TR", f'"{exe_path}" {args}',
+            "/SC", "ONLOGON",
+            "/RL", "HIGHEST",
+            "/DELAY", "0001:00"   # 1 dakika gecikme (sistem oturumu yerlestikten sonra)
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+            if result.returncode == 0:
+                log_success("Gorev zamanlayici ile otomatik baslatma ayarlandi.")
+            else:
+                log_error(f"Task Scheduler hatasi: {result.stderr.strip()}")
+        except Exception as e:
+            log_error(f"Task Scheduler hatasi: {e}")
+    else:
+        cmd = ["schtasks", "/Delete", "/F", "/TN", task_name]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+            if result.returncode == 0:
+                log_success("Gorev zamanlayici gorevi silindi.")
+            else:
+                log_info("Gorev zaten kayitli degil veya silinirken hata olustu.")
+        except Exception as e:
+            log_error(f"Task Scheduler silme hatasi: {e}")
+
+
+def check_autostart_status() -> dict:
+    """Registry ve Task Scheduler uzerinden autostart durumunu kontrol eder."""
+    status = {"registry": False, "task_scheduler": False, "registry_cmd": ""}
+    value_name = "LuckywareShieldUltra"
+    task_name  = "LuckywareShieldUltra"
+
+    # Registry kontrol
+    try:
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, value_name)
+            status["registry"] = True
+            status["registry_cmd"] = val
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    # Task Scheduler kontrol
+    try:
+        result = subprocess.run(
+            ["schtasks", "/Query", "/TN", task_name],
+            capture_output=True, text=True, shell=True
+        )
+        status["task_scheduler"] = result.returncode == 0
+    except Exception:
+        pass
+
+    return status
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STATUS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def display_status():
     log_header("Sistem Durumu")
@@ -207,7 +367,7 @@ def display_status():
     tg_notifier = TelegramNotifier()
     tg_status = f"{Colors.GREEN}Yapilandirildi{Colors.ENDC}" if tg_notifier.is_configured else f"{Colors.WARNING}Devre Disi{Colors.ENDC}"
     print(f"  Telegram Bot     : {tg_status}")
-    
+
     guard = PersistenceGuard()
     droppers = guard.scan_temp_droppers()
     temp_status = f"{Colors.FAIL}Supheli Dosyalar ({len(droppers)}){Colors.ENDC}" if droppers else f"{Colors.GREEN}Temiz{Colors.ENDC}"
@@ -216,7 +376,17 @@ def display_status():
     tg = TokenGuard()
     audit = tg.audit_sensitive_stores()
     disc_count = sum(1 for item in audit.get("Discord", []) if item["exists"])
-    print(f"  Discord Depolari : {disc_count} adet\n")
+    print(f"  Discord Depolari : {disc_count} adet")
+
+    # Autostart durumu
+    ast = check_autostart_status()
+    ast_reg = f"{Colors.GREEN}Registry Aktif{Colors.ENDC}" if ast["registry"] else f"{Colors.DIM}Registry Devre Disi{Colors.ENDC}"
+    ast_ts  = f"{Colors.GREEN}Task Scheduler Aktif{Colors.ENDC}" if ast["task_scheduler"] else f"{Colors.DIM}Task Scheduler Devre Disi{Colors.ENDC}"
+    print(f"  Otomatik Baslatma: {ast_reg}  |  {ast_ts}\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MISC MENU FUNCTIONS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def menu_telegram_test():
     log_header("Telegram Bildirim Testi")
@@ -229,6 +399,7 @@ def menu_telegram_test():
     log_info("Telegram test bildirimi gonderiliyor...")
     notifier.test_connection()
 
+
 def menu_update_c2_feed():
     log_header("C2 Tehdit Istihbarati Guncelleme")
     feed = ThreatIntelFeed()
@@ -240,6 +411,7 @@ def menu_update_c2_feed():
     feed.get_domains(force_refresh=True)
     stats_after = feed.get_stats()
     log_success(f"Guncellendi: Toplam {stats_after['total_count']} C2 domain ({stats_after['remote_count']} uzak kaynak)")
+
 
 def menu_webhook_hunter():
     log_header("Discord Webhook Avcisi")
@@ -269,6 +441,7 @@ def menu_webhook_hunter():
             hunter.delete_webhook(wh)
         log_success("Islem tamamlandi.")
 
+
 def menu_clipboard_guard():
     log_header("Clipboard Guard (Clipper Tespiti)")
     print("Pano izleme baslatiliyor. Kripto cuzdan adresi kopyalayin ve degistirilip")
@@ -284,6 +457,7 @@ def menu_clipboard_guard():
         guard.stop()
         stats = guard.get_stats()
         log_info(f"Durduruldu. Tespit sayisi: {stats['detections']}")
+
 
 def menu_injection_detector():
     log_header("Surec Enjeksiyon Tespiti")
@@ -306,11 +480,11 @@ def menu_injection_detector():
         for issue in finding["issues"]:
             print(f"    -> {issue}")
 
+
 def menu_generate_report():
     log_header("Guvenlik Raporu Olusturuluyor")
     report = ReportGenerator()
 
-    # Hosts durumu
     net = NetworkShield()
     hosts_ok = net.is_hosts_shield_active()
     report.add_section(
@@ -323,7 +497,6 @@ def menu_generate_report():
         deduction=0 if hosts_ok else 10
     )
 
-    # C2 feed durumu
     feed = ThreatIntelFeed()
     fstats = feed.get_stats()
     report.add_section(
@@ -336,7 +509,6 @@ def menu_generate_report():
         ]
     )
 
-    # Telegram durumu
     tg = TelegramNotifier()
     report.add_section(
         "Telegram Bildirimleri",
@@ -345,7 +517,6 @@ def menu_generate_report():
         deduction=0 if tg.is_configured else 5
     )
 
-    # Temp dropper taramasi
     guard = PersistenceGuard()
     droppers = guard.scan_temp_droppers()
     dropper_items = [{"label": d["name"], "value": d["reason"], "severity": "HIGH"} for d in droppers]
@@ -358,7 +529,6 @@ def menu_generate_report():
         deduction=len(droppers) * 15
     )
 
-    # Webhook taramasi
     log_info("Webhook taramasi yapiliyor...")
     hunter = WebhookHunter()
     wh_results = hunter.run_full_scan()
@@ -375,7 +545,6 @@ def menu_generate_report():
         deduction=len(wh_results) * 20
     )
 
-    # Injection taramasi
     log_info("Surec enjeksiyon taramasi yapiliyor...")
     detector = InjectionDetector()
     inj_results = detector.scan_processes()
@@ -395,7 +564,6 @@ def menu_generate_report():
         deduction=sum(15 if r["severity"] == "HIGH" else 5 for r in inj_results)
     )
 
-    # Discord depolari
     tguard = TokenGuard()
     audit = tguard.audit_sensitive_stores()
     disc_items = []
@@ -411,6 +579,18 @@ def menu_generate_report():
         disc_items
     )
 
+    # Autostart durumu
+    ast = check_autostart_status()
+    ast_label = "Registry + Task Scheduler" if (ast["registry"] and ast["task_scheduler"]) else \
+                "Registry" if ast["registry"] else \
+                "Task Scheduler" if ast["task_scheduler"] else "Devre Disi"
+    report.add_section(
+        "Otomatik Baslatma",
+        "ok" if (ast["registry"] or ast["task_scheduler"]) else "warning",
+        [{"label": "Kalici Koruma", "value": ast_label}],
+        deduction=0 if (ast["registry"] or ast["task_scheduler"]) else 10
+    )
+
     filepath = report.save_report()
     log_success(f"Rapor olusturuldu: {filepath}")
     log_info("Raporu tarayicinizda acabilirsiniz.")
@@ -419,6 +599,7 @@ def menu_generate_report():
         os.startfile(filepath)
     except Exception:
         pass
+
 
 def menu_quarantine_manager():
     log_header("Karantina Yonetimi")
@@ -436,7 +617,7 @@ def menu_quarantine_manager():
         return
 
     if not entries:
-        log_info("Karantinada dosya yok.")
+        log_info("Karantinade dosya yok.")
         return
 
     print(f"\n  {Colors.BOLD}Karantinadaki Dosyalar ({len(entries)} adet):{Colors.ENDC}\n")
@@ -498,6 +679,40 @@ def menu_quarantine_manager():
                 json.dump([], f)
             log_success(f"{deleted} dosya kalici olarak silindi.")
 
+
+def menu_autostart():
+    log_header("Otomatik Baslatma Yonetimi")
+
+    ast = check_autostart_status()
+    reg_s  = f"{Colors.GREEN}Aktif{Colors.ENDC}" if ast["registry"] else f"{Colors.DIM}Devre Disi{Colors.ENDC}"
+    ts_s   = f"{Colors.GREEN}Aktif{Colors.ENDC}" if ast["task_scheduler"] else f"{Colors.DIM}Devre Disi{Colors.ENDC}"
+    print(f"  Registry           : {reg_s}")
+    if ast["registry"]:
+        print(f"  Registry Komutu    : {ast['registry_cmd'][:80]}")
+    print(f"  Task Scheduler     : {ts_s}\n")
+
+    print("1. Registry'e ekle (oturum bazli, admin gereksiz)")
+    print("2. Registry'den kaldir")
+    print("3. Task Scheduler'a ekle (sistem seviyesi, admin gerekli)")
+    print("4. Task Scheduler'dan kaldir")
+    print("5. Geri don")
+
+    sub = input("\nSeciminiz (1-5): ").strip()
+    if sub == "1":
+        toggle_autostart(enable=True, use_task_scheduler=False)
+    elif sub == "2":
+        toggle_autostart(enable=False, use_task_scheduler=False)
+    elif sub == "3":
+        if require_admin_or_elevate("Task Scheduler kurulumu"):
+            toggle_autostart(enable=True, use_task_scheduler=True)
+    elif sub == "4":
+        if require_admin_or_elevate("Task Scheduler silme"):
+            toggle_autostart(enable=False, use_task_scheduler=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INTERACTIVE MENU
+# ──────────────────────────────────────────────────────────────────────────────
+
 def interactive_menu():
     while True:
         print_banner()
@@ -517,7 +732,7 @@ def interactive_menu():
         print("  [11] C2 Listesini Guncelle (GitHub)")
         print("  [12] Telegram Bildirim Testi")
         print("  [13] Karantina Yonetimi")
-        print("  [14] Windows Baslangicina Ekle/Kaldir")
+        print("  [14] Otomatik Baslatma Yonetimi")
         print("  [15] Hosts Dosyasini Sifirla")
         print(f"\n  [0] Cikis")
 
@@ -540,7 +755,7 @@ def interactive_menu():
                 for i in items:
                     st = f"Mevcut ({i['file_count']} dosya)" if i["exists"] else "Yok"
                     print(f"  - {i['path']}: {st}")
-            
+
             sub_c = input("\nDiscord dosyalari salt-okunur yapilsin mi? (e/h): ").strip().lower()
             if sub_c in ["e", "evet", "y", "yes"]:
                 tg.lock_discord_storage()
@@ -561,13 +776,7 @@ def interactive_menu():
         elif choice == "13":
             menu_quarantine_manager()
         elif choice == "14":
-            print("1. Baslangica Ekle")
-            print("2. Baslangictan Kaldir")
-            sub = input("Seciminiz (1/2): ").strip()
-            if sub == "1":
-                toggle_autostart(enable=True)
-            elif sub == "2":
-                toggle_autostart(enable=False)
+            menu_autostart()
         elif choice == "15":
             log_header("Hosts Sifirlama")
             net = NetworkShield()
@@ -579,6 +788,10 @@ def interactive_menu():
 
         input("\nDevam etmek icin Enter'a basin...")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN  –  argparse + startup logic
+# ──────────────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(description=f"{APP_NAME} v{APP_VERSION}")
     parser.add_argument("-a", "--all", action="store_true", help="Tum koruma adimlarini uygula.")
@@ -586,9 +799,11 @@ def main():
     parser.add_argument("-d", "--scan-sdk", type=str, nargs="?", const="default", help="SDK veya klasoru tara.")
     parser.add_argument("-c", "--clean-persist", action="store_true", help="Baslangic ve temp temizle.")
     parser.add_argument("-w", "--live-watch", action="store_true", help="Canli kalkani baslat.")
-    parser.add_argument("--daemon", action="store_true", help="Arka planda sessizce calis.")
-    parser.add_argument("--install-autostart", action="store_true", help="Windows baslangicina ekle.")
-    parser.add_argument("--uninstall-autostart", action="store_true", help="Windows baslangicindan kaldir.")
+    parser.add_argument("--daemon", action="store_true", help="Arka planda sessizce calis (watchdog only).")
+    parser.add_argument("--install-autostart", action="store_true", help="Registry'e otomatik baslatma ekle.")
+    parser.add_argument("--uninstall-autostart", action="store_true", help="Registry'den otomatik baslatmayi kaldir.")
+    parser.add_argument("--install-task", action="store_true", help="Task Scheduler ile system-level autostart ekle.")
+    parser.add_argument("--uninstall-task", action="store_true", help="Task Scheduler gorevini kaldir.")
     parser.add_argument("--status", action="store_true", help="Durumu goster.")
     parser.add_argument("--restore-hosts", action="store_true", help="Hosts dosyasini sifirla.")
     parser.add_argument("--test-telegram", action="store_true", help="Telegram baglantisini test et.")
@@ -596,54 +811,79 @@ def main():
     parser.add_argument("--scan-webhooks", action="store_true", help="Discord webhook taramasi yap.")
     parser.add_argument("--scan-injection", action="store_true", help="Surec enjeksiyon taramasi yap.")
     parser.add_argument("--report", action="store_true", help="HTML guvenlik raporu olustur.")
+    parser.add_argument("--no-elevation", action="store_true", help="UAC yukseltme istemini atla.")
 
     args = parser.parse_args()
 
+    # ── DAEMON modu ─────────────────────────────────────────────────────────
     if args.daemon:
+        # Arka plan modu — sessiz, sadece watchdog
         menu_live_watchdog(silent=True)
-    elif args.all:
+        return
+
+    # ── CLI modlari (banner + islem) ────────────────────────────────────────
+    cli_mode = any([
+        args.all, args.shield, args.scan_sdk, args.clean_persist,
+        args.live_watch, args.install_autostart, args.uninstall_autostart,
+        args.install_task, args.uninstall_task, args.status, args.restore_hosts,
+        args.test_telegram, args.update_feed, args.scan_webhooks,
+        args.scan_injection, args.report
+    ])
+
+    if cli_mode:
         print_banner()
-        run_full_protection()
-    elif args.shield:
-        print_banner()
-        net = NetworkShield()
-        net.apply_hosts_block()
-        net.apply_firewall_rules()
-    elif args.scan_sdk:
-        print_banner()
-        scanner = SDKProjectScanner()
-        if args.scan_sdk == "default":
-            scanner.run_full_sdk_scan()
-        else:
-            scanner.scan_path(args.scan_sdk)
-    elif args.clean_persist:
-        print_banner()
-        guard = PersistenceGuard()
-        guard.clean_all_persistence()
-    elif args.live_watch:
-        print_banner()
-        menu_live_watchdog()
-    elif args.install_autostart:
-        toggle_autostart(enable=True)
-    elif args.uninstall_autostart:
-        toggle_autostart(enable=False)
-    elif args.status:
-        display_status()
-    elif args.restore_hosts:
-        net = NetworkShield()
-        net.restore_hosts()
-    elif args.test_telegram:
-        menu_telegram_test()
-    elif args.update_feed:
-        menu_update_c2_feed()
-    elif args.scan_webhooks:
-        menu_webhook_hunter()
-    elif args.scan_injection:
-        menu_injection_detector()
-    elif args.report:
-        menu_generate_report()
-    else:
-        interactive_menu()
+        if not args.no_elevation:
+            _startup_guard()
+
+        if args.all:
+            run_full_protection()
+        elif args.shield:
+            net = NetworkShield()
+            net.apply_hosts_block()
+            net.apply_firewall_rules()
+        elif args.scan_sdk:
+            scanner = SDKProjectScanner()
+            if args.scan_sdk == "default":
+                scanner.run_full_sdk_scan()
+            else:
+                scanner.scan_path(args.scan_sdk)
+        elif args.clean_persist:
+            guard = PersistenceGuard()
+            guard.clean_all_persistence()
+        elif args.live_watch:
+            menu_live_watchdog()
+        elif args.install_autostart:
+            toggle_autostart(enable=True, use_task_scheduler=False)
+        elif args.uninstall_autostart:
+            toggle_autostart(enable=False, use_task_scheduler=False)
+        elif args.install_task:
+            toggle_autostart(enable=True, use_task_scheduler=True)
+        elif args.uninstall_task:
+            toggle_autostart(enable=False, use_task_scheduler=True)
+        elif args.status:
+            display_status()
+        elif args.restore_hosts:
+            net = NetworkShield()
+            net.restore_hosts()
+        elif args.test_telegram:
+            menu_telegram_test()
+        elif args.update_feed:
+            menu_update_c2_feed()
+        elif args.scan_webhooks:
+            menu_webhook_hunter()
+        elif args.scan_injection:
+            menu_injection_detector()
+        elif args.report:
+            menu_generate_report()
+        return
+
+    # ── Interactive menü (argümansız acildi) ───────────────────────────────
+    if not args.no_elevation:
+        _startup_guard()
+
+    print_banner()
+    interactive_menu()
+
 
 if __name__ == "__main__":
     main()

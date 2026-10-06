@@ -5,6 +5,7 @@ import shutil
 import hashlib
 import json
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -62,8 +63,52 @@ def is_admin() -> bool:
         return False
 
 def require_admin_prompt():
+    """Warn user if not admin - does NOT block execution."""
     if not is_admin():
         print(f"{Colors.WARNING}[!] Uyari: Yonetici (Administrator) yetkileri olmadan bazi ozellikler calismayabilir.{Colors.ENDC}")
+
+def elevate_to_admin(args: list = None) -> bool:
+    """
+    Mevcut islemi yonetici yetkileriyle yeniden baslatir (UAC).
+    True donerse zaten admin ya da baslatma basarili, False donerse basarisiz.
+    """
+    if is_admin():
+        return True
+    try:
+        exe = sys.executable
+        script = sys.argv[0] if not getattr(sys, 'frozen', False) else exe
+        extra_args = " ".join(args or sys.argv[1:])
+
+        if getattr(sys, 'frozen', False):
+            # EXE olarak calisiyorsa sadece exe'yi yukselt
+            params = extra_args
+            target = exe
+        else:
+            params = f'"{script}" {extra_args}'
+            target = exe
+
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", target, params, None, 1
+        )
+        return int(ret) > 32
+    except Exception as e:
+        log_error(f"UAC elevation hatasi: {e}")
+        return False
+
+def require_admin_or_elevate(reason: str = "Bu islem") -> bool:
+    """
+    Admin yetkisi yoksa UAC ile yukseltme ister.
+    Kullanici kabul ederse yeni elevated process acilir ve mevcut kapanir.
+    Returns False if not admin and elevation failed/denied.
+    """
+    if is_admin():
+        return True
+    print(f"\n{Colors.WARNING}[!] {reason} icin Yonetici (Administrator) yetkisi gereklidir.{Colors.ENDC}")
+    print(f"{Colors.WARNING}[!] UAC penceresi acilacak, lutfen 'Evet' secin...{Colors.ENDC}\n")
+    success = elevate_to_admin()
+    if success:
+        sys.exit(0)  # Elevated process acildi, mevcut kapat
+    return False
 
 def log_info(msg: str):
     print(f"[*] {msg}")
