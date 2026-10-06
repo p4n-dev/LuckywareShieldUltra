@@ -1,4 +1,4 @@
-# 🛡️ Luckyware Shield Ultra [v2.0.0]
+# 🛡️ Luckyware Shield Ultra [v2.2.1]
 
 **Luckyware Shield Ultra**, geliştiricileri ve oyuncuları hedef alan modern zararlı yazılımlara (özellikle *Luckyware*, C2 exfiltration, Visual Studio/SDK zehirlenmeleri, Discord token hırsızlığı ve kalıcılık sağlayan dropper'lar) karşı geliştirilmiş hafif ve etkili bir gerçek zamanlı güvenlik aracıdır.
 
